@@ -2,7 +2,9 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from rp2.rp2_decimal import RP2Decimal
+from rp2.rp2_error import RP2RuntimeError
 from dali.abstract_pair_converter_plugin import AbstractPairConverterPlugin
+from dali.configuration import Keyword
 from dali.historical_bar import HistoricalBar
 
 from requests import Request, Session
@@ -11,8 +13,8 @@ import json
 import os
 
 class PairConverterPlugin(AbstractPairConverterPlugin):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, historical_price_type: str, fiat_priority: Optional[str] = None):
+        super().__init__(historical_price_type,fiat_priority)
         self.api = CoinmarketcapAPI()
 
     def name(self) -> str:
@@ -25,30 +27,38 @@ class PairConverterPlugin(AbstractPairConverterPlugin):
         result: Optional[HistoricalBar] = None
 
         time_interval_mins = 5
-        start_timestamp = timestamp - timedelta(minutes=time_interval_mins)
+        start_timestamp = timestamp
         utc_timestamp = start_timestamp.astimezone(timezone.utc)
         utc_timestamp_str: str = utc_timestamp.isoformat()
+
+        try:
+            from_id = self.api.get_id_from_asset(from_asset)
+        except CoinmarketcapAPINotFoundException as exception:
+            return result  # could not find asset on Coinmarketcap
         
-        path = 'v2/cryptocurrency/quotes/historical'
-        from_id = self.api.get_id_from_asset(from_asset)
         to_id = self.api.get_id_from_asset(to_asset)
-        id = str(from_id)
-        convert_id = str(to_id)
-        time_start = utc_timestamp_str
-        count = 3
+        try:
+            api_results = self.api.api_request('v2/cryptocurrency/quotes/historical',
+                                               id=str(from_id),
+                                               time_start=utc_timestamp_str,
+                                               count=2,
+                                               convert_id=str(to_id),
+                                               interval=f'{time_interval_mins}m')
+        except Exception as exception:
+            raise CoinmarketcapAPIServerException('Coinmarketcap API connection error') from exception
 
-        # TODO: error handling
-        api_results = self.api.api_request(path,id=id,time_start=time_start,count=count,convert_id=convert_id)
-
-        # TODO: use actual to_asset here instead of USD
-        prices = [quote.USD.price for quote in api_results.data.quotes]
-        volumes = [quote.USD.volume_24h for quote in api_results.data.quotes]
-        high = max(prices)
-        low = min(prices)
-        volume = volumes[-1] - volumes[0]
+        try:
+            # TODO: use actual to_asset here instead of USD
+            prices = [quote.USD.price for quote in api_results.data.quotes]
+            volumes = [quote.USD.volume_24h for quote in api_results.data.quotes]
+            high = max(prices)
+            low = min(prices)
+            volume = volumes[1] - volumes[0]
+        except Exception as exception:
+            raise CoinmarketcapAPIDataException('Coinmarketcap API unexpected data format error') from exception
 
         result = HistoricalBar(
-            duration=timedelta(minutes=time_interval_mins*count),
+            duration=timedelta(minutes=time_interval_mins*2),
             timestamp=start_timestamp,
             open=RP2Decimal(str(prices[0])),
             high=RP2Decimal(str(high)),
@@ -65,6 +75,7 @@ class CoinmarketcapAPI:
     api_base: str
     api_url: str
     id_cache: dict = {} # TODO: cache in file
+    session: Session
 
     def __init__(self):
         self.is_sandbox = False
@@ -79,6 +90,7 @@ class CoinmarketcapAPI:
             self.api_key = api_key
 
         self.api_url = f'https://{self.api_base}.coinmarketcap.com'
+        self.session = Session()
     
     def api_request(self, path, *args, **kwargs):
         headers = {
@@ -91,24 +103,63 @@ class CoinmarketcapAPI:
         else:
             api_parameters = kwargs
 
-        session = Session()
-        session.headers.update(headers)
+        self.session.headers.update(headers)
+        full_path = f"{self.api_url.strip('/')}/{path.strip('/')}"
 
-        # TODO: strip extra forward slash
-        full_path = f"{self.api_url}/{path}"
-
-        # TODO: error handling
-        response = session.get(full_path, params=api_parameters)
+        response = self.session.get(full_path, params=api_parameters)
         data = json.loads(response.text)
         return data
 
     def get_id_from_asset(self, asset: str):
-        if self.id_cache.has_key(asset):
+        if asset in self.id_cache:
             return self.id_cache[asset]
 
-        data = self.api_request('v1/cryptocurrency/map', symbol=asset)
-        if not data:
-            raise('Unknown ID for CoinMarketCap')
+        try:
+            results = self.api_request('/v1/cryptocurrency/map', symbol=asset)
+            status = results['status']
+            error_code = status['error_code']
+            error_message = status['error_message']
+        except Exception as exception:
+            raise CoinmarketcapAPIServerException(f'Error connecting to Coinmarketcap server') from exception
         
-        self.id_cache[asset] = data.id
-        return data.id
+        NONE_FOUND_ERROR_MESSAGE = f'No CoinMarketCap ID found for crypto {asset}'
+        if error_code == 400 and 'Invalid value for "symbol"' in error_message:
+            raise CoinmarketcapAPINotFoundException(NONE_FOUND_ERROR_MESSAGE)
+        
+        try:
+            data = results['data']
+        except Exception as exception:
+            raise CoinmarketcapAPINotFoundException(NONE_FOUND_ERROR_MESSAGE)
+
+        try:
+            if type(data) is list:
+                id_info_list = data
+            elif type(data) is dict:
+                for name, info_list in data.items():
+                    if name.casefold() == asset.casefold():
+                        id_info_list = info_list
+                        break
+
+            id_info_list.sort(key=lambda info: info['rank'])
+            id = None
+            for id_info in id_info_list:
+                if id_info['symbol'].casefold() == asset.casefold():
+                    id = id_info['id']
+                    break
+        except Exception as exception:
+            raise CoinmarketcapAPIDataException(f'Coinmarketcap API unexpected results, data error') from exception
+
+        if id is None:
+            raise CoinmarketcapAPINotFoundException(NONE_FOUND_ERROR_MESSAGE)
+        
+        self.id_cache[asset] = id
+        return id
+
+class CoinmarketcapAPIServerException(RP2RuntimeError):
+    pass
+
+class CoinmarketcapAPIDataException(RP2RuntimeError):
+    pass
+
+class CoinmarketcapAPINotFoundException(RP2RuntimeError):
+    pass
