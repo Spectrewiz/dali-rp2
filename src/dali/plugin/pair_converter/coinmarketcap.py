@@ -59,12 +59,9 @@ class PairConverterPlugin(AbstractPairConverterPlugin):
             return None  # no quotes found
 
         try:
-            from_id_str = str(from_id)
-            to_id_str = str(to_id)
-
-            # TODO create dataclass for quote and auto populate from constructor
-            prices = [quote['quote'][to_id_str]['price'] for quote in data[from_id_str]['quotes']]
-            volumes = [quote['quote'][to_id_str]['volume_24h'] for quote in data[from_id_str]['quotes']]
+            quotes = [CoinmarketcapQuote(quote,from_id,to_id) for quote in data[str(from_id)]['quotes']]
+            prices = [quote.price for quote in quotes]
+            volumes = [quote.volume_24h for quote in quotes]
             high = max(prices[0:1])
             low = min(prices[0:1])
             volume = volumes[1] - volumes[0]
@@ -82,6 +79,30 @@ class PairConverterPlugin(AbstractPairConverterPlugin):
         )
         
         return result
+    
+class CoinmarketcapQuote:
+    timestamp: datetime
+    price: float
+    volume_24h: float
+    market_cap: float
+    circulating_supply: float
+    total_supply: float
+    from_id: int
+    to_id: int
+
+    def __init__(self, quote_dict: dict, from_id: int, to_id: int):
+        self.to_id = to_id
+        self.from_id = from_id
+
+        to_id_str = str(to_id)
+        from_id_str = str(from_id)
+
+        self.price = quote_dict['quote'][to_id_str]['price']
+        self.timestamp = datetime.fromisoformat(quote_dict['quote'][to_id_str]['timestamp'].strip('Z'))  # trim trailing Z
+        self.volume_24h = quote_dict['quote'][to_id_str]['volume_24h']
+        self.market_cap = quote_dict['quote'][to_id_str]['market_cap']
+        self.circulating_supply = quote_dict['quote'][to_id_str]['circulating_supply']
+        self.total_supply = quote_dict['quote'][to_id_str]['total_supply']
 
 class CoinmarketcapAPI:
     is_sandbox: bool
