@@ -34,7 +34,7 @@ class PairConverterPlugin(AbstractPairConverterPlugin):
         try:
             from_id = self.api.get_id_from_asset(from_asset)
         except CoinmarketcapAPINotFoundException as exception:
-            return result  # could not find asset on Coinmarketcap
+            return None  # could not find asset on Coinmarketcap
         
         to_id = self.api.get_id_from_asset(to_asset)
         try:
@@ -44,15 +44,29 @@ class PairConverterPlugin(AbstractPairConverterPlugin):
                                                count=2,
                                                convert_id=str(to_id),
                                                interval=f'{time_interval_mins}m')
+            status = api_results['status']
+            error_code = status['error_code']
+            error_message = status['error_message']
         except Exception as exception:
             raise CoinmarketcapAPIServerException('Coinmarketcap API connection error') from exception
+        
+        if error_code == 1006:
+            return None  # cannot use API endpoint
+        
+        try:
+            data = api_results['data']
+        except:
+            return None  # no quotes found
 
         try:
-            # TODO: use actual to_asset here instead of USD
-            prices = [quote.USD.price for quote in api_results.data.quotes]
-            volumes = [quote.USD.volume_24h for quote in api_results.data.quotes]
-            high = max(prices)
-            low = min(prices)
+            from_id_str = str(from_id)
+            to_id_str = str(to_id)
+
+            # TODO create dataclass for quote and auto populate from constructor
+            prices = [quote['quote'][to_id_str]['price'] for quote in data[from_id_str]['quotes']]
+            volumes = [quote['quote'][to_id_str]['volume_24h'] for quote in data[from_id_str]['quotes']]
+            high = max(prices[0:1])
+            low = min(prices[0:1])
             volume = volumes[1] - volumes[0]
         except Exception as exception:
             raise CoinmarketcapAPIDataException('Coinmarketcap API unexpected data format error') from exception
@@ -143,7 +157,7 @@ class CoinmarketcapAPI:
             id_info_list.sort(key=lambda info: info['rank'])
             id = None
             for id_info in id_info_list:
-                if id_info['symbol'].casefold() == asset.casefold():
+                if self.is_sandbox or id_info['symbol'].casefold() == asset.casefold():
                     id = id_info['id']
                     break
         except Exception as exception:
