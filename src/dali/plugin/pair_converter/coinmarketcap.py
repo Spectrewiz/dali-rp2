@@ -9,6 +9,7 @@ from dali.historical_bar import HistoricalBar
 
 from requests import Request, Session
 from requests.exceptions import ConnectionError, Timeout, TooManyRedirects
+from numbers import Number
 import json
 import os
 
@@ -24,85 +25,29 @@ class PairConverterPlugin(AbstractPairConverterPlugin):
         return self.name()
 
     def get_historic_bar_from_native_source(self, timestamp: datetime, from_asset: str, to_asset: str, exchange: str) -> Optional[HistoricalBar]:
-        result: Optional[HistoricalBar] = None
-
-        time_interval_mins = 5
-        start_timestamp = timestamp
-        utc_timestamp = start_timestamp.astimezone(timezone.utc)
-        utc_timestamp_str: str = utc_timestamp.isoformat()
-
         try:
-            from_id = self.api.get_id_from_asset(from_asset)
-        except CoinmarketcapAPINotFoundException as exception:
-            return None  # could not find asset on Coinmarketcap
-        
-        to_id = self.api.get_id_from_asset(to_asset)
-        try:
-            api_results = self.api.api_request('v2/cryptocurrency/quotes/historical',
-                                               id=str(from_id),
-                                               time_start=utc_timestamp_str,
-                                               count=2,
-                                               convert_id=str(to_id),
-                                               interval=f'{time_interval_mins}m')
-            status = api_results['status']
-            error_code = status['error_code']
-            error_message = status['error_message']
+            quotes = self.api.get_historical_price_of_asset(timestamp,count=2,asset=from_asset,conversion_asset=to_asset)
+            high = max(quotes.prices[0:1])
+            low = min(quotes.prices[0:1])
+            volume = quotes.volumes_24h[1] - quotes.volumes_24h[0]
         except Exception as exception:
-            raise CoinmarketcapAPIServerException('Coinmarketcap API connection error') from exception
-        
-        if error_code == 1006:
-            return None  # cannot use API endpoint
-        
-        try:
-            data = api_results['data']
-        except:
-            return None  # no quotes found
-
-        try:
-            quotes = [CoinmarketcapQuote(quote,from_id,to_id) for quote in data[str(from_id)]['quotes']]
-            prices = [quote.price for quote in quotes]
-            volumes = [quote.volume_24h for quote in quotes]
-            high = max(prices[0:1])
-            low = min(prices[0:1])
-            volume = volumes[1] - volumes[0]
-        except Exception as exception:
-            raise CoinmarketcapAPIDataException('Coinmarketcap API unexpected data format error') from exception
+            return None
 
         result = HistoricalBar(
-            duration=timedelta(minutes=time_interval_mins*2),
-            timestamp=start_timestamp,
-            open=RP2Decimal(str(prices[0])),
+            duration=timedelta(minutes=10),
+            timestamp=quotes.timestamps[0],
+            open=RP2Decimal(str(quotes.prices[0])),
             high=RP2Decimal(str(high)),
             low=RP2Decimal(str(low)),
-            close=RP2Decimal(str(prices[1])),
+            close=RP2Decimal(str(quotes.prices[1])),
             volume=RP2Decimal(str(volume)),
         )
         
+        if self.api.is_sandbox:
+            return None
+
         return result
-    
-class CoinmarketcapQuote:
-    timestamp: datetime
-    price: float
-    volume_24h: float
-    market_cap: float
-    circulating_supply: float
-    total_supply: float
-    from_id: int
-    to_id: int
 
-    def __init__(self, quote_dict: dict, from_id: int, to_id: int):
-        self.to_id = to_id
-        self.from_id = from_id
-
-        to_id_str = str(to_id)
-        from_id_str = str(from_id)
-
-        self.price = quote_dict['quote'][to_id_str]['price']
-        self.timestamp = datetime.fromisoformat(quote_dict['quote'][to_id_str]['timestamp'].strip('Z'))  # trim trailing Z
-        self.volume_24h = quote_dict['quote'][to_id_str]['volume_24h']
-        self.market_cap = quote_dict['quote'][to_id_str]['market_cap']
-        self.circulating_supply = quote_dict['quote'][to_id_str]['circulating_supply']
-        self.total_supply = quote_dict['quote'][to_id_str]['total_supply']
 
 class CoinmarketcapAPI:
     is_sandbox: bool
@@ -189,6 +134,88 @@ class CoinmarketcapAPI:
         
         self.id_cache[asset] = id
         return id
+        
+    def get_historical_price_of_asset(self, timestamp: datetime, count: int, asset: str | Number, conversion_asset: str | Number) -> Optional['CoinmarketcapQuotes']:
+        try:
+            if type(asset) is Number:
+                from_id = asset
+            else:
+                from_id = self.get_id_from_asset(asset)
+        except CoinmarketcapAPINotFoundException as exception:
+            return None  # could not find asset on Coinmarketcap
+        
+        if type(conversion_asset) is Number:
+            to_id = conversion_asset
+        else:
+            try:
+                to_id = self.get_id_from_asset(conversion_asset)
+            except Exception as exception:
+                raise CoinmarketcapAPINotFoundException(f'Could not find conversion ID for {conversion_asset}') from exception
+
+        try:
+            time_interval_mins = 5
+            start_timestamp = timestamp
+            utc_timestamp = start_timestamp.astimezone(timezone.utc)
+            utc_timestamp_str: str = utc_timestamp.isoformat()
+
+            api_results = self.api_request('v2/cryptocurrency/quotes/historical',
+                                           id=str(from_id),
+                                           time_start=utc_timestamp_str,
+                                           count=count,
+                                           convert_id=str(to_id),
+                                           interval=f'{time_interval_mins}m')
+            status = api_results['status']
+            error_code = status['error_code']
+            error_message = status['error_message']
+        except Exception as exception:
+            raise CoinmarketcapAPIServerException('Coinmarketcap API connection error') from exception
+        
+        if error_code == 1006:
+            return None  # cannot use API endpoint
+        
+        if error_code != 0:
+            raise CoinmarketcapAPIServerException(f'Coinmarketcap API connection error: {error_message}')
+        
+        try:
+            data = api_results['data']
+        except:
+            return None  # no quotes found
+        
+        return CoinmarketcapQuotes(data,from_id,to_id)
+
+
+class CoinmarketcapQuotes:
+    timestamps: list[datetime]
+    prices: list[Number]
+    volumes_24h: list[Number]
+    market_caps: list[Number]
+    circulating_supplies: list[Number]
+    total_supplies: list[Number]
+    count: int
+
+    from_id: int
+    to_id: int
+
+    def __init__(self, api_response_data: dict, from_id: int, to_id: int):
+        self.to_id = to_id
+        self.from_id = from_id
+
+        to_id_str = str(to_id)
+        from_id_str = str(from_id)
+
+        # parse out quote data from API response
+        quotes = api_response_data[from_id_str]['quotes']
+        self.prices = [quote['quote'][to_id_str]['price'] for quote in quotes]
+        self.volumes_24h = [quote['quote'][to_id_str]['volume_24h'] for quote in quotes]
+        self.market_caps = [quote['quote'][to_id_str]['market_cap'] for quote in quotes]
+        self.circulating_supplies = [quote['quote'][to_id_str]['circulating_supply'] for quote in quotes]
+        self.total_supplies = [quote['quote'][to_id_str]['total_supply'] for quote in quotes]
+        self.timestamps = [
+            datetime.fromisoformat(quote['quote'][to_id_str]['timestamp'].strip('Z'))  # trim trailing Z
+            for quote in quotes]
+
+        self.count = len(quotes)
+
 
 class CoinmarketcapAPIServerException(RP2RuntimeError):
     pass
